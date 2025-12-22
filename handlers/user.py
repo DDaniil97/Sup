@@ -1,178 +1,145 @@
-from aiogram import Router, Bot, F
+from aiogram import Router, Bot
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram import F
+from sqlalchemy import select
 
 from database import SessionLocal
-from models import User, Ticket
-from enums import TicketStatus, MessageRole, MessageType
-
-
-from services.tickets import get_active_ticket_for_user
-from services.messages import save_message
-
+from enums import TicketStatus
+from models import Ticket, User, Manager
+from services.notify import notify_managers
+from models import Message as TicketMessage
 
 router = Router()
 
-
-@router.message(CommandStart())
-async def start_handler(message: Message):
-    async with SessionLocal() as session:
-        user = await session.get(User, message.from_user.id)
-
-        if not user:
-            user = User(
-                telegram_user_id=message.from_user.id,
-                username=message.from_user.username,
-                first_name=message.from_user.first_name
-            )
-            session.add(user)
-
-        ticket = Ticket(
-            user_telegram_id=message.from_user.id,
-            status=TicketStatus.WAITING_MANAGER
-        )
-        session.add(ticket)
-
-        await session.commit()
-
-    await message.answer(
-        "ОТРИМАТИ БОНУС\n\n"
-        "Заявка прийнята. Підключаємо менеджера. Очікуйте."
-    )
-
-
-from services.notify import notify_managers
+user_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="✍️ Написать обращение")]],
+    resize_keyboard=True
+)
 
 
 @router.message(CommandStart())
-async def start_handler(message: Message, bot: Bot):
+async def user_start(message: Message):
     async with SessionLocal() as session:
-        user = await session.get(User, message.from_user.id)
-
-        if not user:
-            user = User(
-                telegram_user_id=message.from_user.id,
-                username=message.from_user.username,
-                first_name=message.from_user.first_name
-            )
-            session.add(user)
-
-        ticket = Ticket(
-            user_telegram_id=message.from_user.id,
-            status=TicketStatus.WAITING_MANAGER
-        )
-        session.add(ticket)
-        await session.commit()
-
-        user_info = (
-            f"👤 {message.from_user.first_name}\n"
-            f"@{message.from_user.username}\n"
-            f"ID: {message.from_user.id}\n"
-            f"⏰ {ticket.created_at}"
-        )
-
-        await notify_managers(bot, session, ticket.id, user_info)
-
-    await message.answer(
-        "ОТРИМАТИ БОНУС\n\n"
-        "Заявка прийнята. Підключаємо менеджера. Очікуйте."
-    )
-
-
-
-@router.message(F.content_type.in_({"text", "photo", "video", "voice", "sticker"}))
-async def user_message_handler(message: Message, bot):
-    async with SessionLocal() as session:
-        ticket = await get_active_ticket_for_user(
-            session, message.from_user.id
-        )
-
-        if not ticket:
+        # 🔹 ЕСЛИ ЭТО МЕНЕДЖЕР — НЕ ПОКАЗЫВАЕМ КНОПКУ
+        manager = await session.get(Manager, message.from_user.id)
+        if manager and manager.is_manager and manager.is_active:
             await message.answer(
-                "⏳ Очікуйте, менеджер ще не підключився"
+                "🧑‍💼 Вы менеджер поддержки\n\n"
+                "Используйте команду /dialogs для работы с обращениями"
             )
             return
 
-        manager_id = ticket.assigned_manager_telegram_id
+        # 🔹 ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ
+        user = await session.get(User, message.from_user.id)
+        if not user:
+            user = User(
+                telegram_user_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name
+            )
+            session.add(user)
+            await session.commit()
 
-        # === ТЕКСТ ===
-        if message.text:
-            await bot.send_message(manager_id, message.text)
+    await message.answer(
+        "👋 Добро пожаловать в поддержку!\n"
+        "Нажмите кнопку ниже, чтобы написать обращение.",
+        reply_markup=user_keyboard
+    )
 
-            await save_message(
+@router.message(
+    F.content_type.in_({"text", "photo", "video", "voice"}) &
+    ~F.text.startswith("/")
+)
+async def user_message_handler(message: Message, bot: Bot):
+    async with SessionLocal() as session:
+        # Проверяем, является ли отправитель менеджером
+        manager = await session.get(Manager, message.from_user.id)
+        if manager and manager.is_manager and manager.is_active:
+            # Менеджер пишет — логика не меняется
+            result = await session.execute(
+                select(Ticket)
+                .where(Ticket.assigned_manager_telegram_id == message.from_user.id)
+                .order_by(Ticket.created_at.desc())
+                .limit(1)
+            )
+            ticket = result.scalar_one_or_none()
+            if not ticket:
+                await message.answer("❌ Нет активного тикета для ответа")
+                return
+
+            msg_record = TicketMessage(
+                ticket_id=ticket.id,
+                from_role="manager",
+                message_type=message.content_type,
+                text=message.text,
+                telegram_message_id=message.message_id
+            )
+            session.add(msg_record)
+            await session.commit()
+
+            await bot.send_message(
+                chat_id=ticket.user_telegram_id,
+                text=f"🧑‍💻 Менеджер:\n{message.text}"
+            )
+            await message.answer("✅ Сообщение отправлено пользователю")
+            return
+
+        # Обычный пользователь
+        result = await session.execute(
+            select(Ticket)
+            .where(
+                Ticket.user_telegram_id == message.from_user.id,
+                Ticket.status.in_([
+                    TicketStatus.WAITING_MANAGER,
+                    TicketStatus.ASSIGNED
+                ])
+            )
+            .order_by(Ticket.created_at.desc())
+            .limit(1)
+        )
+        ticket = result.scalar_one_or_none()
+
+        if not ticket:
+            # Нет текущего тикета — создаём новый
+            ticket = Ticket(
+                user_telegram_id=message.from_user.id,
+                status=TicketStatus.WAITING_MANAGER
+            )
+            session.add(ticket)
+            await session.commit()
+            await session.refresh(ticket)
+
+        # Сохраняем сообщение пользователя
+        msg_record = TicketMessage(
+            ticket_id=ticket.id,
+            from_role="user",
+            message_type=message.content_type,
+            text=message.text,
+            telegram_message_id=message.message_id
+        )
+        session.add(msg_record)
+        await session.commit()
+
+        # Отправляем уведомление только тем менеджерам, кто ведёт тикет
+        if ticket.assigned_manager_telegram_id:
+            # Тикет уже взят менеджером — отправляем только ему
+            await bot.send_message(
+                chat_id=ticket.assigned_manager_telegram_id,
+                text=f"👤 Пользователь:\n{message.text}"
+            )
+        else:
+            # Тикет еще не взят — уведомляем всех менеджеров
+            user_info = (
+                f"👤 {message.from_user.first_name}\n"
+                f"@{message.from_user.username}\n"
+                f"ID: {message.from_user.id}"
+            )
+            await notify_managers(
+                bot=bot,
                 session=session,
                 ticket_id=ticket.id,
-                from_role=MessageRole.USER,
-                message_type=MessageType.TEXT,
-                telegram_message_id=message.message_id,
-                text=message.text,
+                user_info=user_info
             )
 
-        # === ФОТО ===
-        elif message.photo:
-            photo = message.photo[-1]
-            await bot.send_photo(
-                manager_id,
-                photo.file_id,
-                caption=message.caption
-            )
-
-            await save_message(
-                session,
-                ticket_id=ticket.id,
-                from_role=MessageRole.USER,
-                message_type=MessageType.PHOTO,
-                telegram_message_id=message.message_id,
-                caption=message.caption,
-                file_id=photo.file_id,
-            )
-
-        # === ВИДЕО ===
-        elif message.video:
-            await bot.send_video(
-                manager_id,
-                message.video.file_id,
-                caption=message.caption
-            )
-
-            await save_message(
-                session,
-                ticket_id=ticket.id,
-                from_role=MessageRole.USER,
-                message_type=MessageType.VIDEO,
-                telegram_message_id=message.message_id,
-                caption=message.caption,
-                file_id=message.video.file_id,
-            )
-
-        # === VOICE ===
-        elif message.voice:
-            await bot.send_voice(
-                manager_id,
-                message.voice.file_id
-            )
-
-            await save_message(
-                session,
-                ticket_id=ticket.id,
-                from_role=MessageRole.USER,
-                message_type=MessageType.VOICE,
-                telegram_message_id=message.message_id,
-                file_id=message.voice.file_id,
-            )
-
-        # === STICKER ===
-        elif message.sticker:
-            await bot.send_sticker(
-                manager_id,
-                message.sticker.file_id
-            )
-
-            await save_message(
-                session,
-                ticket_id=ticket.id,
-                from_role=MessageRole.USER,
-                message_type=MessageType.STICKER,
-                telegram_message_id=message.message_id,
-                file_id=message.sticker.file_id,
-            )
+    await message.answer("✅ Сообщение отправлено в поддержку")

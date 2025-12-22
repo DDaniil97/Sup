@@ -4,7 +4,7 @@ from aiogram.filters import Command
 from database import SessionLocal
 from services.history import get_ticket_history
 from services.manager_state import get_manager_state
-
+from enums import MessageRole
 router = Router()
 
 
@@ -25,7 +25,7 @@ async def show_history(message):
 
         text = "📜 История:\n\n"
         for msg in history:
-            who = "👤" if msg.from_role == "user" else "🧑‍💼"
+            who = "👤" if msg.from_role == MessageRole.USER.value else "🧑‍💼"
             if msg.text:
                 text += f"{who} {msg.text}\n"
 
