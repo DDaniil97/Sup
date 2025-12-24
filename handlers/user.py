@@ -1,8 +1,12 @@
+from datetime import datetime
+
 from aiogram import Router, Bot
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.filters import CommandStart
 from aiogram import F
 from sqlalchemy import select
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 
 from database import SessionLocal
 from enums import TicketStatus
@@ -13,7 +17,7 @@ from models import Message as TicketMessage
 router = Router()
 
 user_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="✍️ Написать обращение")]],
+    keyboard=[[KeyboardButton(text="❌ Закрыть тикет")]],
     resize_keyboard=True
 )
 
@@ -43,7 +47,7 @@ async def user_start(message: Message):
 
     await message.answer(
         "👋 Добро пожаловать в поддержку!\n"
-        "Нажмите кнопку ниже, чтобы написать обращение.",
+        "Напишите Ваш вопрос и отправьте сообщение.",
         reply_markup=user_keyboard
     )
 
@@ -80,8 +84,10 @@ async def user_message_handler(message: Message, bot: Bot):
 
             await bot.send_message(
                 chat_id=ticket.user_telegram_id,
-                text=f"🧑‍💻 Менеджер:\n{message.text}"
+                text="📩 Вам ответил менеджер\n\n" + message.text,
+                reply_markup=user_close_ticket_keyboard(ticket.id)
             )
+
             await message.answer("✅ Сообщение отправлено пользователю")
             return
 
@@ -143,3 +149,15 @@ async def user_message_handler(message: Message, bot: Bot):
             )
 
     await message.answer("✅ Сообщение отправлено в поддержку")
+
+def user_close_ticket_keyboard(ticket_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❌ Закрыть тикет",
+                    callback_data=f"close_ticket:{ticket_id}"
+                )
+            ]
+        ]
+    )

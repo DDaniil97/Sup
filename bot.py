@@ -13,7 +13,8 @@ from handlers.manager_history import router as manager_history_router
 from handlers.manager_close import router as manager_close_router
 from handlers.manager_callbacks import router as manager_callbacks_router
 from handlers.admin import router as admin_router
-
+from services.auto_close import auto_close_tickets
+from handlers.close_ticket import router as close_ticket_router
 
 async def bootstrap_managers():
     async with SessionLocal() as session:
@@ -65,6 +66,8 @@ async def main():
     dp.include_router(manager_history_router)
     dp.include_router(manager_close_router)
 
+    asyncio.create_task(auto_close_tickets(bot))
+    dp.include_router(close_ticket_router)
     await dp.start_polling(bot)
 
 
